@@ -1,0 +1,1176 @@
+--!ScriptAPI: 1.22.3
+--!ScriptVersion: 1.2.3
+ScriptV = "Release 1.2.3"
+-- Copyright (c)2020 vb-data e.U.
+-- Script name: vbdata-shopiq-connector.vsp
+-- Author: Jürgen Viertbauer
+-- Date: 12/2020
+-- Last change: 07.04.2021
+-- Function: Connector fpr incoming and outgoing message via TCP/IP from Shop-IQ; adding incoming message infos to a script canvas field
+--           1.0 -      06.12.2020: Basisfunktionalitaet
+--           1.1 -      13.12.2020: Timer für Zeitablauf im Status eingebaut, verschiedene Formatmöglichkeiten, zusätzliches Status-Symbol für das Senden von Daten
+--           1.2 -      15.12.2020: Add Icons to Canvas view
+--           1.2.3 -    07.04.2021: BugFix => better error handling on missing facts
+--           1.3 - Future: Data entry mask handling => Event OnDataEntryMaskClose
+
+-- globals
+sIniFile = "VPOS:vbdata-shopiq-connector.ini"
+sLangFile = "VPOS:vbdata-shopiq-connector.lang"
+sJournalFile = "VPOS:vbdata-shopiq-connector.dat"
+appName = "Shop-IQ Connector"
+
+local iniTab
+decimalTableValue = 90
+currencyTableValue = 431
+cTNEFT = 202
+cFNEFTScript = 29
+cETX = "]"
+posNo = ""
+serverSocket = nil
+serverTimeout = 1000
+local timerList = {}
+local timer1GoalTime = nil
+local timer2GoalTime = nil
+local lastSendAction = 0 -- 0 means nothing, 1 means OK, -1 means failed
+
+-------------------------------------------------------------------------------------------------------------------------
+
+-- ***************************
+-- *** TEXTKONSTANTEN
+-- ***************************
+txtPortNotOpened = 1
+txtTimeout = 2
+
+-------------------------------------------------------------------------------------------------------------------------
+
+-- constants
+idErrorOnSocketBind = 300
+idHeaderError = 500
+
+-- **********************************************************************************
+-- *** Helper
+-- **********************************************************************************
+
+-------------------------------------------------------------------------------------------------------------------------
+-- <F>
+-- writes a json log message to a socket
+--
+function logToService(application, messagetype, message, level)
+    if (Debug) then
+        if (DebugLevel < level) then
+            return
+        end
+
+        if (logsocket == nil) then
+            CheckForTCPLogging()
+        end
+
+        if (logsocket) then
+            --create table from message
+            local messageTable = {}
+            messageTable.application = "VPOS<" .. StationId .. ">: " .. appName .. "->" .. application
+            messageTable.messagetype = messagetype
+            messageTable.message = message
+
+            -- convert table to json
+            local jsonMessage = vpos.utils.encodeJSON(messageTable)
+
+            -- and send data to logservice
+            logsocket:write(jsonMessage)
+
+            logsocket:close()
+            logsocket = nil
+        end
+    end
+end
+
+-------------------------------------------------------------------------------------------------------------------------
+-- <F>
+-- create a new logging socket if not exist
+--
+function CheckForTCPLogging()
+    if (Debug) then
+        if (TCPLogIp ~= nil and TCPLogPort ~= nil) then
+            logsocket = vpos.communication.Socket(TCPLogIp, TCPLogPort, LogTimeout)
+        end
+    end
+end
+
+-------------------------------------------------------------------------------------------------------------------------
+-- <F>
+-- returns an error text to a given error code; if not exists returns t.b.d.
+--
+function getText(errid)
+    local text = "t.b.d."
+    if (langTab ~= nil and langTab[lang] ~= nil) then
+        local tx = langTab[lang]["x" .. tostring(errid)]
+        if (tx ~= nil) then
+            text = tx
+        end
+    end
+    return text
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: Split an list with comma (not semikolon)
+--[[
+  
+      string.split (s, p)
+      ====================================================================
+      Splits the string [s] into substrings wherever pattern [p] occurs.
+  
+      Returns: a table of substrings or, if no match is made [nil].
+  
+  --]]
+string.split = function(s, p)
+    local temp = {}
+    local index = 0
+    local last_index = string.len(s)
+
+    while true do
+        local i, e = string.find(s, p, index)
+
+        if i and e then
+            local next_index = e + 1
+            local word_bound = i - 1
+            table.insert(temp, string.sub(s, index, word_bound))
+            index = next_index
+        else
+            if index > 0 and index <= last_index then
+                table.insert(temp, string.sub(s, index, last_index))
+            elseif index == 0 then
+                temp = nil
+            end
+            break
+        end
+    end
+
+    return temp
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: Trim strings
+function trim(s)
+    return s:match "^%s*(.-)%s*$"
+end
+
+-------------------------------------------------------------------------------------------------------
+-- <F> CompareTimes (Time1, Time2)
+-- Compares to given time objects - if Time1 is greater return 1, if Time2 is greater return 2, if equal return 0
+--
+function CompareTimes(time1, time2)
+    local t1Hour = tonumber(time1:get(vpos.datetime.DateField.Hour))
+    local t1Minute = tonumber(time1:get(vpos.datetime.DateField.Minute))
+    local t1Second = tonumber(time1:get(vpos.datetime.DateField.Second))
+    local t1CalcValue = (t1Hour * 10000) + (t1Minute * 100) + t1Second
+
+    local t2Hour = tonumber(time2:get(vpos.datetime.DateField.Hour))
+    local t2Minute = tonumber(time2:get(vpos.datetime.DateField.Minute))
+    local t2Second = tonumber(time2:get(vpos.datetime.DateField.Second))
+    local t2CalcValue = (t2Hour * 10000) + (t2Minute * 100) + t2Second
+
+    if (t1CalcValue > t2CalcValue) then
+        return 1
+    elseif (t1CalcValue < t2CalcValue) then
+        return 2
+    else
+        return 0
+    end
+end
+
+-------------------------------------------------------------------------------------------------------
+-- <F> TimeDiffMinutes(time1, time2)
+-- Calculates the difference of minutes between two time stamps
+--
+function TimeDiffMinutes(time1, time2)
+    -- time1 and time2 are formatted like mm:ss
+    -- return type can be a integer number
+    -- means: if time difference is 02:30 it should return 2, if time is 00:34 it sould return 0
+    local minutesTime1 = time1:get(vpos.datetime.DateField.Minute)
+    local minutesTime2 = time2:get(vpos.datetime.DateField.Minute)
+    local result = minutesTime1 - minutesTime2
+
+    if (result < 0) then
+        result = 0
+    end
+
+    return result
+end
+
+-------------------------------------------------------------------------------------------------------
+-- <F> TimeDiffSeconds(time1, time2)
+-- Calculates the difference of seconds between two time stamps
+--
+function TimeDiffSeconds(time1, time2)
+    -- time1 and time2 are formatted like mm:ss
+    -- return type can be a integer number
+    -- means: if time difference is 02:30 it should return 30, if time is 00:34 it sould return 34
+    local secondsTime1 = time1:get(vpos.datetime.DateField.Second)
+    local secondsTime2 = time2:get(vpos.datetime.DateField.Second)
+    local result = secondsTime1 - secondsTime2
+
+    return result
+end
+
+--=======================================================================================================================
+
+-- ***************************
+-- *** EVENTS
+-- ***************************
+function OnMediaLeave(event)
+    local application = "OnMediaBeforePayment"
+    logToService(application, "Information", "Entry point", 1)
+
+    local itemsTable = CreateItemsTableFromCurrentReceipt()
+    SendData(itemsTable)
+    SendStatusToCanvas()
+end
+
+--------------------------------------------------------------------------------------------------------
+
+function OnDataEntryMaskClose(event)
+    local application = "OnDataEntryMaskClose"
+    logToService(application, "Information", "Entry point", 1)
+
+    local mask = event:getMask() -- vpos.dataentry.Mask-Object
+    if (mask ~= nil) then
+        logToService(application, "Information", "Mask: " .. mask:getName(), 1)
+        for entry in vpos.dataentry.getUsedEntries() do
+            local val = entry:getValue(29)
+            if (val ~= nil and tonumber(val) ~= 0) then
+                logToService(
+                    application,
+                    "Information",
+                    "  -> : " .. entry:getNo() .. " -> " .. entry:getName() .. " val: " .. val,
+                    1
+                )
+            end
+        end
+    end
+end
+
+--------------------------------------------------------------------------------------------------------
+
+function OnDataAvailable()
+    local applicationName = "OnDataAvailable"
+    logToService(applicationName, "Information", "Function started", 1)
+
+    -- create a client socket - receive message - process message - return result - destroy client socket
+
+    -- create client socket
+    clientSocket = serverSocket:accept()
+
+    -- receive message until cETX has been received
+    receivedMessage = clientSocket:read(cETX)
+
+    -- ToDo: process message
+    result = {}
+
+    -- cleanup the received message - delete header infos
+    local cleanedMessageString = CleanupMessage(receivedMessage)
+    logToService(applicationName, "Information", "Received: " .. cleanedMessageString, 1)
+
+    -- extracting the received information
+    local recInfoTab = vpos.utils.decodeJSON(cleanedMessageString)
+
+    -- correct message structure sent?
+    if (recInfoTab == nil) then
+        clientSocket:write("HTTP/1.1 500 Internal Server Error")
+        local infoWindow = vpos.view.InfoWindow("Falsches Datensatzformat: " .. receivedMessage, "Fehler", true, 5)
+        infoWindow:show()
+        -- destroy client socket if message was received
+        clientSocket:close()
+        clientSocket = nil
+
+        -- recreate socket ;-)
+        CreateSocket()
+        return
+    end
+
+    -- was there 2 messages sent?
+    if (#recInfoTab ~= 2) then
+        clientSocket:write("HTTP/1.1 500 Internal Server Error")
+        local infoWindow = vpos.view.InfoWindow("Anzahl der Nachrichten ist falsch!", "Fehler", true, 5)
+        infoWindow:show()
+        -- destroy client socket if message was received
+        clientSocket:close()
+        clientSocket = nil
+
+        -- recreate socket ;-)
+        CreateSocket()
+        return
+    end
+
+    -- check the correct names of the structure
+    if (recInfoTab[1].image_url == nil or recInfoTab[2].image_url == nil) then
+        clientSocket:write("HTTP/1.1 500 Internal Server Error")
+        local infoWindow = vpos.view.InfoWindow("Fehlendes Feld im Datensatz: <image_url>", "Fehler", true, 5)
+        infoWindow:show()
+        -- destroy client socket if message was received
+        clientSocket:close()
+        clientSocket = nil
+
+        -- recreate socket ;-)
+        CreateSocket()
+        return
+    end
+
+    if (recInfoTab[1].name == nil or recInfoTab[2].name == nil) then
+        clientSocket:write("HTTP/1.1 500 Internal Server Error")
+        local infoWindow = vpos.view.InfoWindow("Fehlendes Feld im Datensatz: <name>", "Fehler", true, 5)
+        infoWindow:show()
+        -- destroy client socket if message was received
+        clientSocket:close()
+        clientSocket = nil
+
+        -- recreate socket ;-)
+        CreateSocket()
+        return
+    end
+
+    if (recInfoTab[1].time == nil or recInfoTab[2].time == nil) then
+        clientSocket:write("HTTP/1.1 500 Internal Server Error")
+        local infoWindow = vpos.view.InfoWindow("Fehlendes Feld im Datensatz: <time>", "Fehler", true, 5)
+        infoWindow:show()
+        -- destroy client socket if message was received
+        clientSocket:close()
+        clientSocket = nil
+
+        -- recreate socket ;-)
+        CreateSocket()
+        return
+    end
+
+    if (recInfoTab[1].time == "") then
+        recInfoTab[1].time = "00:00"
+    end
+
+    if (recInfoTab[2].time == "") then
+        recInfoTab[2].time = "00:00"
+    end
+
+    -- check if the time values are numbers
+    -- if (IsTime(recInfoTab[1].time) == false or IsTime(recInfoTab[2].time) == false) then
+    --     clientSocket:write("HTTP/1.1 500 Internal Server Error")
+    --     local infoWindow = vpos.view.InfoWindow("Falscher Time-Eintrag im Datensatz", "Fehler", true, 5)
+    --     infoWindow:show()
+    --     -- destroy client socket if message was received
+    --     clientSocket:close()
+    --     clientSocket = nil
+  
+    --     -- recreate socket ;-)
+    --     CreateSocket()
+    --     return
+    -- end
+
+    -- return result to caller
+    resultOfWork = DoWork(recInfoTab)
+    if (resultOfWork ~= "") then
+        clientSocket:write("HTTP/1.1 500 Internal Server Error")
+    else
+        clientSocket:write("HTTP/1.1 200 OK")
+    end
+
+    -- destroy client socket if message was received
+    clientSocket:close()
+    clientSocket = nil
+
+    -- recreate socket ;-)
+    CreateSocket()
+end
+
+--------------------------------------------------------------------------------------------------------
+
+--=======================================================================================================================
+
+-- ***************************
+-- *** FUNCTIONS
+-- ***************************
+
+-- <F> CreateSocket
+-- The function creates a new socket or reactivates an existing one
+function CreateSocket()
+    local applicationName = "CreateSocket"
+    logToService(applicationName, "Information", "Entry point", 1)
+
+    if (serverSocket == nil) then
+        serverSocket = vpos.communication.ServerSocket(ServerSocketPort)
+        if (serverSocket ~= nil) then
+            serverSocket:registerEventFunction("OnDataAvailable")
+        else
+            vpos.view.showWindow(GetText(idErrorOnSocketBind), GetText(idHeaderError))
+        end
+    end
+end
+
+--------------------------------------------------------------------------------------------------------
+-- <F> DoWork (table)
+-- This function analyzes the incoming table and start further process
+--
+function DoWork(messageTable)
+    local applicationName = "DoWork"
+    logToService(applicationName, "Information", "Function started", 1)
+
+    -- what to be done?
+    -- send both text lines to control 1 and 2
+    -- send timer data to canvas 2
+
+    SendMessagesToCanvas(messageTable)
+
+    timerList.timer1 = messageTable[1].time
+    timerList.timer2 = messageTable[2].time
+
+    local lastTimer1 = string.split(timerList.timer1, ":")
+    --BugFix on 07.04.2021: error handling
+    if (lastTimer1 == nil) then
+        lastTimer1 = {0, 0}
+    end
+    
+    local lastTimer2 = string.split(timerList.timer2, ":")
+    --BugFix on 07.04.2021: error handling
+    if (lastTimer2 == nil) then
+        lastTimer2 = {0, 0}
+    end
+
+    timer1GoalTime = vpos.datetime.DateTime()
+    timer1GoalTime:add(vpos.datetime.DateField.Minute, tonumber(lastTimer1[1]))
+    timer1GoalTime:add(vpos.datetime.DateField.Second, tonumber(lastTimer1[2]))
+
+    timer2GoalTime = vpos.datetime.DateTime()
+    timer2GoalTime:add(vpos.datetime.DateField.Minute, tonumber(lastTimer2[1]))
+    timer2GoalTime:add(vpos.datetime.DateField.Second, tonumber(lastTimer2[2]))
+
+    -- start a timer until the times are zero
+
+    if (TimerInSeconds ~= nil and tonumber(TimerInSeconds) > 0) then
+        vpos.events.registerTimerFunction("CallStatusTimer", tonumber(TimerInSeconds) * 1000)
+    else 
+        SendStatusToCanvas()
+    end
+
+    return ""
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function CallStatusTimer()
+-- Calculates the time between last received timer and actual time
+-- Actualize the timer
+-- Show the Status Canvas
+function CallStatusTimer()
+    local application = "CallStatusTimer"
+
+    local thisTime = vpos.datetime.DateTime()
+
+    if (CompareTimes(timer1GoalTime, thisTime) == 1) then
+        local newSeconds = TimeDiffSeconds(timer1GoalTime, thisTime)
+        if (newSeconds < 0) then
+            timerList.timer1 =
+                tostring(TimeDiffMinutes(timer1GoalTime, thisTime) - 1) .. ":" .. FormatSeconds(60 - (newSeconds * -1))
+        else
+            timerList.timer1 = tostring(TimeDiffMinutes(timer1GoalTime, thisTime)) .. ":" .. FormatSeconds(newSeconds)
+        end
+    else
+        timerList.timer1 = "0:00"
+    end
+
+    if (CompareTimes(timer2GoalTime, thisTime) == 1) then
+        local newSeconds = TimeDiffSeconds(timer2GoalTime, thisTime)
+        if (newSeconds < 0) then
+            timerList.timer2 =
+                tostring(TimeDiffMinutes(timer2GoalTime, thisTime) - 1) .. ":" .. FormatSeconds(60 - (newSeconds * -1))
+        else
+            timerList.timer2 = tostring(TimeDiffMinutes(timer2GoalTime, thisTime)) .. ":" .. FormatSeconds(newSeconds)
+        end
+    else
+        timerList.timer2 = "0:00"
+    end
+
+    -- -- if time from timer 1 and timer 2 are smaler than actual time
+    -- -- stop the timer (until a new time will be received)
+    if (IsTime(timerList.timer1, true) == false and IsTime(timerList.timer2, true) == false) then
+        vpos.events.unregisterTimerFunction()
+    end
+
+    SendStatusToCanvas()
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: CreateItemsTableFromCurrentReceipt ()
+-- returns a table fullfilled with all items
+--
+function CreateItemsTableFromCurrentReceipt()
+    local tmpItemsTable = {}
+
+    --  what do wee need for the items table?
+    --  a. article_id (plu no) = number
+    --  b. quantity = number
+    --  c. employee_number (can be a number or an employee name) = text
+
+    local receipt = vpos.receipt.Receipt()
+    local operatorNo = receipt:getOperatorNo()
+
+    if (receipt ~= nil) then
+        for rrplu in receipt:getPLUs() do
+            local tmpItem = {}
+            tmpItem.article_id = tonumber(rrplu:getPLUNo())
+            tmpItem.quantity = tonumber(rrplu:getQuantity())
+            tmpItem.employee_number = tostring(operatorNo)
+            if (rrplu:isVoidPLU() == true) then
+                tmpItem.quantity = tmpItem.quantity * -1
+            end
+            table.insert(tmpItemsTable, tmpItem)
+        end
+    end
+
+    return tmpItemsTable
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: SendData (table)
+-- creates JSON structure from table data, check if data storage is given, send alle data from data storage + new item to URI
+function SendData(tblData)
+    local application = "SendData"
+    logToService(application, "Information", "Entry point", 1)
+
+    -- check which type is this receipt (sale, cancellation, waste)
+    local type = ""
+    local gotPositiveItem = false
+    local gotNegativeItem = false
+
+    if (tblData ~= nil) then
+        -- (1)
+        local file = vpos.script.Script(sJournalFile)
+        if (file == nil) then
+            file = vpos.script.newScript(sJournalFile)
+        end
+        if (file == nil) then
+            logToService(applicationName, "Error", "FATAL: Can´t create " .. sJournalFile, 1)
+            return
+        end
+
+        data = {}
+        dataTab = {}
+        dataTab.positions = {}
+
+        -- here we should get a list of positions without header
+        json = file:getData()
+        if (json ~= nil and string.len(json) >= 10) then
+            data = vpos.utils.decodeJSON(json)
+            -- add the positions to the dataTab-Positions
+            for k, v in pairs(data) do
+                table.insert(dataTab.positions, v)
+            end
+        end
+
+        -- (2)
+        for i, j in pairs(tblData) do
+            local tblItem = {}
+            tblItem.article_id = j.article_id
+            tblItem.employee_number = j.employee_number
+            tblItem.quantity = j.quantity
+            if (j.quantity > 0) then
+                gotPositiveItem = true
+            end
+            if (j.quantity < 0) then
+                gotNegativeItem = true
+            end
+            table.insert(dataTab.positions, tblItem)
+        end
+
+        -- now check the type of the receipt
+        if (gotPositiveItem == true and gotNegativeItem == false) then
+            type = "sale"
+        elseif (gotPositiveItem == true and gotNegativeItem == true) then
+            type = "sale"
+        elseif (gotPositiveItem == false and gotNegativeItem == true) then
+            type = "cancellation"
+        end
+
+        -- (3) - send all stored items to URI
+        local httpClient = vpos.communication.HTTPClient {timeout = SendTimeout}
+
+        -- create request header
+        dataTab.date = GetFormattedDateTimeString()
+        -- type can be ("sale" if it is a sell item, "cancellation" if it is a cancellation item, "waste" if it is like "Bruch/Verderb" with additional "waste_reason") = text
+        dataTab.type = type
+
+        -- -- iterate throupgh all items from storage data and add to the table positions
+        -- for key, value in ipairs(data) do
+        --     -- for n,m in pairs(v) do
+        --     -- end;
+        --     for k, v in pairs(value) do
+        --         table.insert(dataTab.positions, v)
+        --     end
+        -- end
+
+        local dataFullEncoded = vpos.utils.encodeJSON(dataTab)
+        local dataPostionsEncoded = vpos.utils.encodeJSON(dataTab.positions)
+
+        logToService(application, "Information", "Send data: " .. dataFullEncoded, 1)
+
+        httpClient:setHeaderField("Content-Type", "application/json")
+        local responseBody, result, err = httpClient:request("POST", URI, dataFullEncoded)
+        if (result == 0 and responseBody ~= nil) then
+            local Response = httpClient:getResponseStatuscode()
+            if (Response ~= nil and Response >= 200 and Response <= 299) then
+                logToService(application, "Information", "Data send was successful", 1)
+                logToService(application, "Information", "Response message: " .. responseBody, 1)
+                lastSendAction = 1
+                file:setData("")
+                return 0
+            else
+                logToService(application, "Error", "Data send failed. Response: " .. tostring(Response), 1)
+                logToService(application, "Error", "Response message: " .. responseBody, 1)
+                lastSendAction = -1
+                file:setData(dataPostionsEncoded)
+                return -1
+            end
+        end
+        if (result == 1 and err ~= nil) then
+            logToService(application, "Error", "Data send failed: " .. err, 1)
+            -- write back to the storage
+            file:setData(dataPostionsEncoded)
+            lastSendAction = -1
+            return -1
+        end
+    else
+        logToService(application, "Error", "Missing data table - unable to send data to host", 1)
+        lastSendAction = -1
+        return -1
+    end
+end
+
+--------------------------------------------------------------------------------------------------------
+-- <F> GetFormattedDateTimeString
+-- Formats a given or actual date and return as string
+function GetFormattedDateTimeString(dateTime)
+    local now = dateTime
+    if (now == nil) then
+        now = vpos.datetime.DateTime()
+    end
+
+    day, month, year = now:getDate()
+    hour, minute, second = now:getTime()
+
+    if (tonumber(day) < 10) then
+        day = "0" .. day
+    end
+
+    if (tonumber(month) < 10) then
+        month = "0" .. month
+    end
+
+    if (tonumber(hour) < 10) then
+        hour = "0" .. hour
+    end
+
+    if (tonumber(minute) < 10) then
+        minute = "0" .. minute
+    end
+
+    if (tonumber(second) < 10) then
+        second = "0" .. second
+    end
+
+    local dateTimeString = year .. "-" .. month .. "-" .. day .. "T" .. hour .. ":" .. minute .. ":" .. second
+
+    return dateTimeString
+end
+
+--------------------------------------------------------------------------------------------------------
+-- <F> FormatSeconds (integer)
+-- Formats a given or actual value of seconds and returns "0" .. seconds if secands < 10
+function FormatSeconds(seconds)
+    if (seconds < 10) then
+        return "0" .. tostring(seconds)
+    else
+        return tostring(seconds)
+    end
+end
+
+--------------------------------------------------------------------------------------------------------
+-- <F> CreateGraphicOnCanvas
+-- Write a symbol and text to a canvas object
+function CreateGraphicOnCanvas()
+    if (MessageCanvasIsActive == false) then
+        return
+    end
+
+    local messageCanvasPNG = vpos.graphic.Image() --Image Objekt wird angelegt
+    local statusCanvasPNG = vpos.graphic.Image() --Image Objekt wird angelegt
+
+    local messageCanvas = vpos.view.CanvasWindow {id = MessageCanvasId, fromLayout = true}
+    local statusCanvas = vpos.view.CanvasWindow {id = StatusCanvasId, fromLayout = true}
+
+    local messageCanvasWidth, messageCanvasHeight = messageCanvas:getClientSize()
+    local statusCanvasWidth, statusCanvasHeight = statusCanvas:getClientSize()
+
+    messageCanvasPNG:createBlank(messageCanvasWidth, messageCanvasHeight, MessageCanvasBackgroundColor)
+    statusCanvasPNG:createBlank(statusCanvasWidth, statusCanvasHeight, StatusCanvasBackgroundColor)
+
+    messageCanvasPNG:drawRect {
+        fromX = 1,
+        fromY = 1,
+        width = messageCanvasWidth - 2,
+        height = messageCanvasHeight - 2,
+        lineWidth = 2,
+        color = 5,
+        fill = false,
+        cornerRadiusX = 2,
+        cornerRadiusY = 2
+    }
+    if (ShowLineSeperator) then
+        messageCanvasPNG:drawLine {
+            fromX = 1,
+            fromY = messageCanvasHeight / 2,
+            toX = messageCanvasWidth - 2,
+            toY = messageCanvasHeight / 2,
+            width = MessageCanvasLineSeperatorHeight,
+            color = MessageCanvasLineSeperatorColor
+        }
+    end
+
+    messageCanvasPNG:drawText {
+        posX = Messagetext1PosX,
+        posY = MessagetextDistanceTop,
+        text = "Hello world, this is a new message",
+        vposFont = Messagetext1FontSize
+    }
+    messageCanvasPNG:drawText {
+        posX = Messagetext2PosX,
+        posY = (messageCanvasHeight / 2) + MessagetextDistanceTop,
+        text = "How are you?",
+        vposFont = Messagetext2FontSize
+    }
+
+    statusCanvasPNG:drawText {
+        posX = Statustext1PosX,
+        posY = StatustextDistanceTop,
+        text = GetFormattedDateTimeString(),
+        vposFont = Statustext1FontSize
+    }
+
+    -- load status picture
+    local statusIncomingPNG = vpos.graphic.Image()
+    statusIncomingPNG:createBlank {width = 15, height = 15}
+
+    local fileGetImage = io.open("VPOS:input.png", "rb")
+    local getBinary = fileGetImage:read("a")
+    local binaryPNG = statusIncomingPNG:fromBinary(getBinary)
+    if (binaryPNG ~= true) then
+        vpos.view.showWindow("Es ist kein Bild vorhanden!")
+    end
+    fileGetImage:close()
+    fileGetImage = nil
+
+    statusCanvasPNG:drawImage {
+        posX = StatussymbolDistanceTop,
+        posY = 0,
+        image = statusIncomingPNG
+    }
+
+    messageCanvas:drawImage(0, 0, messageCanvasPNG)
+    statusCanvas:drawImage(0, 0, statusCanvasPNG)
+end
+
+--------------------------------------------------------------------------------------------------------
+-- <F> SendMessagesToCanvas(table)
+function SendMessagesToCanvas(msgTable)
+    local application = "SendMessagesToCanvas"
+    logToService(application, "Information", "Entry point", 2)
+
+    if (MessageCanvasIsActive == false) then
+        return
+    end
+
+    -- if not MainLayout
+    local layout = vpos.view.getCurrentLayout()
+    if (layout ~= MainLayoutNo) then
+        return
+    end
+
+    local messageCanvasPNG = vpos.graphic.Image() --Image Objekt wird angelegt
+    local messageCanvas = vpos.view.CanvasWindow {id = MessageCanvasId, fromLayout = true}
+    local messageCanvasWidth, messageCanvasHeight = messageCanvas:getClientSize()
+
+    messageCanvasPNG:createBlank(messageCanvasWidth, messageCanvasHeight, MessageCanvasBackgroundColor)
+
+    if (MessageCanvasShowRectangle) then
+        messageCanvasPNG:drawRect {
+            fromX = 1,
+            fromY = 1,
+            width = messageCanvasWidth - 2,
+            height = messageCanvasHeight - 2,
+            lineWidth = MessageCanvasLineWidth,
+            color = MessageCanvasLineColor,
+            fill = MessageCanvasFill,
+            cornerRadiusX = MessageCanvasCornerRadiusX,
+            cornerRadiusY = MessageCanvasCornerRadiusY
+        }
+    end
+
+    if (MessageCanvasShowLineSeperator) then
+        messageCanvasPNG:drawLine {
+            fromX = 1,
+            fromY = messageCanvasHeight / 2,
+            toX = messageCanvasWidth - 2,
+            toY = messageCanvasHeight / 2,
+            width = MessageCanvasLineSeperatorHeight,
+            color = MessageCanvasLineSeperatorColor
+        }
+    end
+
+    -- draw the png from URL if found
+    -- load from URL
+    if (MessageIconsActive) then
+        if (msgTable ~= nil and msgTable[1].image_url ~= nil and msgTable[2].image_url ~= nil) then
+            local pic1Image = GetPicFromUrl(msgTable[1].image_url)
+            local pic2Image = GetPicFromUrl(msgTable[2].image_url)
+
+            if (pic1Image ~= nil) then
+                messageCanvasPNG:drawImage {
+                    posX = Messageicon1PosX,
+                    posY = MessageiconDistanceTop,
+                    image = pic1Image
+                }
+            end
+
+            if (pic2Image ~= nil) then
+                messageCanvasPNG:drawImage {
+                    posX = Messageicon2PosX,
+                    posY = (messageCanvasHeight / 2) + MessageiconDistanceTop,
+                    image = pic2Image
+                }
+            end
+        end
+    end
+
+    messageCanvasPNG:drawText {
+        posX = Messagetext1PosX,
+        posY = MessagetextDistanceTop,
+        text = msgTable[1].name,
+        vposFont = Messagetext1FontSize
+    }
+    messageCanvasPNG:drawText {
+        posX = Messagetext2PosX,
+        posY = (messageCanvasHeight / 2) + MessagetextDistanceTop,
+        text = msgTable[2].name,
+        vposFont = Messagetext2FontSize
+    }
+
+    messageCanvas:drawImage(0, 0, messageCanvasPNG)
+end
+
+--------------------------------------------------------------------------------------------------------
+-- <F> SendStatusToCanvas(table)
+function SendStatusToCanvas(jobid)
+    local application = "SendStatusToCanvas"
+
+    -- now the small status canvas with timer
+    if (StatusCanvasIsActive == false) then
+        return
+    end
+
+    -- if not MainLayout
+    local layout = vpos.view.getCurrentLayout()
+    if (layout ~= MainLayoutNo) then
+        return
+    end
+
+    local statusCanvasPNG = vpos.graphic.Image() --Image Objekt wird angelegt
+    local statusCanvas = vpos.view.CanvasWindow {id = StatusCanvasId, fromLayout = true}
+    local statusCanvasWidth, statusCanvasHeight = statusCanvas:getClientSize()
+
+    statusCanvasPNG:createBlank(statusCanvasWidth, statusCanvasHeight, StatusCanvasBackgroundColor)
+
+    if (StatusCanvasShowRectangle) then
+        statusCanvasPNG:drawRect {
+            fromX = 1,
+            fromY = 1,
+            width = statusCanvasWidth - 2,
+            height = statusCanvasHeight - 2,
+            lineWidth = StatusCanvasLineWidth,
+            color = StatusCanvasLineColor,
+            fill = StatusCanvasFill,
+            cornerRadiusX = StatusCanvasCornerRadiusX,
+            cornerRadiusY = StatusCanvasCornerRadiusY
+        }
+    end
+
+    if (StatusCanvasShowVerticalLineSeperator) then
+        statusCanvasPNG:drawLine {
+            fromX = tonumber(StatusCanvasVerticalLineSeperatorStartX),
+            fromY = 1,
+            toX = tonumber(StatusCanvasVerticalLineSeperatorStartX),
+            toY = statusCanvasHeight - 1,
+            width = tonumber(StatusCanvasVerticalLineSeperatorHeight),
+            color = tonumber(StatusCanvasVerticalLineSeperatorColor)
+        }
+    end
+
+    -- jobid = nil means do all the jobs
+    if (jobid == nil) then
+        if (StatusCanvasShowHorizontalLineSeperator) then
+            statusCanvasPNG:drawLine {
+                fromX = tonumber(StatusCanvasHorizontalLineSeperatorStartX),
+                fromY = statusCanvasHeight / 2,
+                toX = statusCanvasWidth - 2,
+                toY = statusCanvasHeight / 2,
+                width = tonumber(StatusCanvasHorizontalLineSeperatorHeight),
+                color = tonumber(StatusCanvasHorizontalLineSeperatorColor)
+            }
+        end
+
+        if (IsTime(timerList.timer1, true) == true) then
+            statusCanvasPNG:drawText {
+                posX = tonumber(Statustext1PosX),
+                posY = tonumber(StatustextDistanceTop),
+                text = timerList.timer1,
+                vposFont = tonumber(Statustext1FontSize),
+                textColor = tonumber(Statustext1FontColor)
+            }
+        else
+            statusCanvasPNG:drawText {
+                posX = tonumber(Statustext1PosX),
+                posY = tonumber(StatustextDistanceTop),
+                text = Statustext1ReadyText,
+                vposFont = tonumber(Statustext1ReadyFontSize),
+                textColor = tonumber(Statustext1ReadyFontColor)
+            }
+        end
+
+        if (IsTime(timerList.timer2, true) == true) then
+            statusCanvasPNG:drawText {
+                posX = tonumber(Statustext2PosX),
+                posY = (statusCanvasHeight / 2) + tonumber(StatustextDistanceTop),
+                text = timerList.timer2,
+                vposFont = tonumber(Statustext2FontSize),
+                textColor = tonumber(Statustext2FontColor)
+            }
+        else
+            statusCanvasPNG:drawText {
+                posX = tonumber(Statustext2PosX),
+                posY = (statusCanvasHeight / 2) + tonumber(StatustextDistanceTop),
+                text = Statustext2ReadyText,
+                vposFont = tonumber(Statustext2ReadyFontSize),
+                textColor = tonumber(Statustext2ReadyFontColor)
+            }
+        end
+
+        -- load status timer picture
+        local statusIncomingPNG = vpos.graphic.Image()
+        statusIncomingPNG:createBlank {width = 24, height = 24}
+
+        local fileGetImage = io.open("VPOS:" .. TimerstatussymbolName, "rb")
+        local getBinary = fileGetImage:read("a")
+        local binaryPNG = statusIncomingPNG:fromBinary(getBinary)
+        if (binaryPNG ~= true) then
+            logToService(application, "Error", "No status picture found!", 1)
+        end
+        fileGetImage:close()
+        fileGetImage = nil
+
+        statusCanvasPNG:drawImage {
+            posX = tonumber(TimerstatussymbolDistanceLeft),
+            posY = tonumber(TimerstatussymbolDistanceTop),
+            image = statusIncomingPNG
+        }
+    end
+
+    -- now draw the last message send status
+    if (lastSendAction ~= 0) then
+        local sendResultPNG = vpos.graphic.Image()
+        sendResultPNG:createBlank {width = 24, height = 24}
+
+        local getSendStatusImageOK = nil
+        if (lastSendAction == 1) then
+            getSendStatusImageOK = io.open("VPOS:" .. SendingstatussymbolNameOK, "rb")
+        else
+            getSendStatusImageOK = io.open("VPOS:" .. SendingstatussymbolNameFailed, "rb")
+        end
+
+        local getSendStatusImageBinary = getSendStatusImageOK:read("a")
+        local binaryOfSendStatusImage = sendResultPNG:fromBinary(getSendStatusImageBinary)
+        if (binaryOfSendStatusImage ~= true) then
+            logToService(application, "Error", "No message send status picture found!", 1)
+        end
+        getSendStatusImageOK:close()
+        getSendStatusImageOK = nil
+
+        statusCanvasPNG:drawImage {
+            posX = tonumber(SendingstatussymbolDistanceLeft),
+            posY = tonumber(SendingstatussymbolDistanceTop),
+            image = sendResultPNG
+        }
+    end
+
+    statusCanvas:drawImage(0, 0, statusCanvasPNG)
+end
+
+--------------------------------------------------------------------------------------------------------
+-- <F> ShowSendStatusOnCanvas()
+function ShowSendStatusOnCanvas()
+    local application = "SendStatusToCanvas"
+end
+
+--------------------------------------------------------------------------------------------------------
+-- Function CleanupMessage(string)
+-- Removes the header informations from the received string if given
+--
+function CleanupMessage(message)
+    -- read message line by line until the first [ was found
+    local retMessage = ""
+    local isInBrackets = false
+
+    -- split lines in a table with \n sign
+    local tblLines = string.split(message, "\n")
+    for k, v in pairs(tblLines) do
+        if (string.sub(v, 1, 1) == "[") then
+            isInBrackets = true
+        end
+
+        if (isInBrackets == true) then
+            retMessage = retMessage .. v
+        end
+
+        if (string.sub(v, 1, 1) == "]") then
+            isInBrackets = false
+        end
+    end
+
+    retMessage = retMessage .. "]"
+
+    return retMessage
+end
+
+--------------------------------------------------------------------------------------------------------
+-- <F> HttpConnection(string)
+-- Returns the responseBody from the request
+--
+function HttpConnection(url)
+    local application = "HttpConnection"
+    logToService(application, "Information", "Entry point", 2)
+
+    local httpClient = vpos.communication.HTTPClient()
+    local responseBody, err = httpClient:request("GET", url)
+
+    if (err ~= 0) then
+        logToService(application, "Error", err, 1)
+    end
+
+    return responseBody
+end
+
+--------------------------------------------------------------------------------------------------------
+-- <F> GetPicFromUrl(string)
+-- Load a picture binary file from url and returns an image
+--
+function GetPicFromUrl(url, filename)
+    local application = "GetPicFromUrl"
+    logToService(application, "Information", "Entry point", 2)
+
+    local responseBodyImage = HttpConnection(url)
+
+    local retImage = vpos.graphic.Image()
+    local binaryPNG = retImage:fromBinary(responseBodyImage)
+
+    if (binaryPNG ~= true) then
+        logToService(application, "Warning", "No picture found on " .. url, 1)
+    end
+
+    return retImage
+end
+
+-------------------------------------------------------------------------------------------------------
+-- <F> IsTime(string time-format mm:ss)
+function IsTime(timeString, checkValue)
+    if (timeString == "") then
+        return false
+    end
+
+    local splittedTimeValue = string.split(timeString, ":")
+    if (splittedTimeValue == nil) then
+        return false
+    end
+
+    if (#splittedTimeValue ~= 2) then
+        return false
+    end
+
+    local val1 = tonumber(splittedTimeValue[1])
+    if (val1 == nil) then
+        return false
+    end
+
+    local val2 = tonumber(splittedTimeValue[2])
+    if (val2 == nil) then
+        return false
+    end
+
+    if (checkValue ~= nil) then
+        if (val1 == 0 and val2 == 0) then
+            return false
+        end
+    end 
+
+    return true
+end
+
+--=======================================================================================================================
+
+-- ***************************
+-- *** MAIN
+-- ***************************
+
+local applicationName = "MAIN"
+
+-- read ini file
+ini = vpos.script.Script(sIniFile)
+if (ini == nil) then
+    ini = vpos.script.newScript(sIniFile)
+end
+if (ini ~= nil) then
+    txt = ini:getData()
+    loadstring(txt)()
+end
+
+-- read language file
+langTab = vpos.utils.readIniFromFile(sLangFile)
+if (lang == nil) then
+    lang = vpos.getSystemInfo(vpos.SystemInfo.FlashLanguage) -- Ger
+end
+
+-- check decimal sign
+decimalTable = vpos.tables.Table(decimalTableValue)
+decimalTableData = decimalTable:getData(1, 5) -- (Nummer des Records, wo die dezimalstellen gesetzt werden, Feldnummer der dezimalstellen)
+
+-- check currency
+currencyTable = vpos.tables.Table(currencyTableValue)
+currencyTableData = currencyTable:getData(1, 1) -- (Nummer des Records, wo das Trennzeichen gesetzt werden, Feldnummer des Trennzeichen)
+
+-- get system informations
+posNo = vpos.getSystemInfo(vpos.SystemInfo.ECRNo)
+
+-- write log header for application
+logToService(applicationName, "Information", "====================================================================", 1)
+logToService(applicationName, "Information", appName, 1)
+logToService(applicationName, "Information", "Script-Version: " .. ScriptV, 1)
+logToService(applicationName, "Information", "Language: " .. lang, 1)
+logToService(applicationName, "Information", "====================================================================", 1)
+
+-- create a socket to terminal and add an data available event to it
+if (socket == nil) then
+    CreateSocket()
+    if (serverSocket == nil) then
+        vpos.view.showWindow(GetText(idErrorOnSocketBind), GetText(idHeaderError))
+    end
+end
+
+-- activate the listeners
+vpos.events.registerEventFunction(vpos.events.OnMediaLeave, "OnMediaLeave")
+-- vpos.events.registerEventFunction(vpos.events.OnDataEntryMaskClose, "OnDataEntryMaskClose")

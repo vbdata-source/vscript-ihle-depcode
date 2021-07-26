@@ -1,0 +1,31 @@
+-- Copyright (c)2021 vb-data e.U.
+-- Script name: vbdata-ihle-depcode.lang
+-- Author: Jürgen Viertbauer
+-- Date: 07/2021
+-- Last change: 06.07.2021
+
+[Eng]
+x1      = CantOpenPort         
+x2      = Timeout 
+x100    = No summed items found for barcode creation
+x101    = No items found in receipt
+x102    = Tax is missing for item
+x500    = Info
+x501    = Warning
+x502    = Error   
+x800    = %=        ======================== 
+x801    = %=        Please pay at the market   
+x802    = %=        ========================   
+
+[Ger]
+x1      = Portoeffnung misslungen
+x2      = Timeout erreicht
+x100    = Keine aufsummierten Artikel fuer Barcodeerzeugung gefunden 
+x101    = Keine Artikelzeilen im Bon gefunden
+x102    = Steuerinformation bei Artikel fehlt
+x500    = Info
+x501    = Warnung
+x502    = Fehler
+x800    = %=       ======================= 
+x801    = %=       Bitte im Markt Bezahlen
+x802    = %=       =======================  

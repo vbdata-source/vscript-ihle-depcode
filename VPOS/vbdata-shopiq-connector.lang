@@ -1,0 +1,17 @@
+-- Copyright (c)2020 vb-data e.U.
+-- Script name: vbdata-shopiq-connector.lang
+-- Author: Jürgen Viertbauer
+-- Date: 12/2020
+-- Last change: 06.12.2020
+
+[Eng]
+x1      = CantOpenPort         
+x2      = Timeout 
+x300    = Socket error
+x500    = Error         
+
+[Ger]
+x1      = Portoeffnung misslungen
+x2      = Timeout erreicht
+x300    = Socket Verbindung 
+x500    = Fehler

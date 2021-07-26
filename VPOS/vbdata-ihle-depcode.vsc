@@ -1,0 +1,561 @@
+--!ScriptAPI: 1.22.3
+--!ScriptVersion: 0.2.0
+ScriptV = "Release 0.2.0"
+-- Copyright (c)2021 vb-data e.U.
+-- Script name: vbdata-ihle-depcode.vsp
+-- Author: Jürgen Viertbauer
+-- Date: 07/2021
+-- Last change: 06.07.2021
+-- Function: Connector fpr incoming and outgoing message via TCP/IP from Shop-IQ; adding incoming message infos to a script canvas field
+--           0.1 -      06.07.2021: Initial
+--           0.2 -      26.07.2021: BugFix => wrong ean if item amount decimal count 2 is null
+
+-- globals
+sIniFile = "VPOS:vbdata-ihle-depcode.ini"
+sLangFile = "VPOS:vbdata-ihle-depcode.lang"
+sJournalFile = "VPOS:vbdata-ihle-depcode.dat"
+appName = "Department Code Printer"
+
+local iniTab
+decimalTableValue = 90
+currencyTableValue = 431
+cTNEFT = 202
+cFNEFTScript = 29
+cETX = "]"
+posNo = ""
+serverSocket = nil
+serverTimeout = 1000
+
+-------------------------------------------------------------------------------------------------------------------------
+
+-- ***************************
+-- *** TEXTKONSTANTEN
+-- ***************************
+txtPortNotOpened = 1
+txtTimeout = 2
+txtNoSummedItemsFound = 100
+txtNoItemsFoundInReceipt = 101
+txtTaxMissingOnItem = 102
+txtInfo = 500
+txtWarning = 501
+txtError = 502
+txtInfotextLine1 = 800
+txtInfotextLine2 = 801
+txtInfotextLine3 = 802
+
+-- ***************************
+-- *** GLOBALE WERTE
+-- ***************************
+info = 1
+warn = 2
+error = 3
+
+-------------------------------------------------------------------------------------------------------------------------
+
+-- **********************************************************************************
+-- *** Helper
+-- **********************************************************************************
+
+-------------------------------------------------------------------------------------------------------------------------
+-- <F>
+-- writes a json log message to a socket
+--
+function logToService(application, messagetype, message, level)
+    if (Debug) then
+        if (DebugLevel < level) then
+            return
+        end
+
+        if (logsocket == nil) then
+            CheckForTCPLogging()
+        end
+
+        if (logsocket) then
+            --create table from message
+            local messageTable = {}
+            messageTable.application = "VPOS<" .. StationId .. ">: " .. appName .. "->" .. application
+            messageTable.messagetype = messagetype
+            messageTable.message = message
+
+            -- convert table to json
+            local jsonMessage = vpos.utils.encodeJSON(messageTable)
+
+            -- and send data to logservice
+            logsocket:write(jsonMessage)
+
+            logsocket:close()
+            logsocket = nil
+        end
+    end
+end
+
+-------------------------------------------------------------------------------------------------------------------------
+-- <F>
+-- create a new logging socket if not exist
+--
+function CheckForTCPLogging()
+    if (Debug) then
+        if (TCPLogIp ~= nil and TCPLogPort ~= nil) then
+            logsocket = vpos.communication.Socket(TCPLogIp, TCPLogPort, LogTimeout)
+        end
+    end
+end
+
+-------------------------------------------------------------------------------------------------------------------------
+-- <F>
+-- returns an error text to a given error code; if not exists returns t.b.d.
+--
+function getText(errid)
+    local text = "t.b.d."
+    if (langTab ~= nil and langTab[lang] ~= nil) then
+        local tx = langTab[lang]["x" .. tostring(errid)]
+        if (tx ~= nil) then
+            text = tx
+        end
+    end
+    return text
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: Split an list with comma (not semikolon)
+--[[
+  
+      string.split (s, p)
+      ====================================================================
+      Splits the string [s] into substrings wherever pattern [p] occurs.
+  
+      Returns: a table of substrings or, if no match is made [nil].
+  
+  --]]
+string.split = function(s, p)
+    local temp = {}
+    local index = 0
+    local last_index = string.len(s)
+
+    while true do
+        local i, e = string.find(s, p, index)
+
+        if i and e then
+            local next_index = e + 1
+            local word_bound = i - 1
+            table.insert(temp, string.sub(s, index, word_bound))
+            index = next_index
+        else
+            if index > 0 and index <= last_index then
+                table.insert(temp, string.sub(s, index, last_index))
+            elseif index == 0 then
+                temp = nil
+            end
+            break
+        end
+    end
+
+    return temp
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: Trim strings
+function trim(s)
+    return s:match "^%s*(.-)%s*$"
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: GetStringAmountWithoutDecimalSign (BCDFix)
+function GetStringAmountWithoutDecimalSign(amount)
+    local application = "GetStringAmountWithoutDecimalSign"
+    logToService(application, "Information", "Entry point", 3)
+
+    -- check if decimal value is only one digit
+    -- if so, add a zero char to the end
+    local valToString = tostring(amount)
+    valToString = string.gsub(valToString, ",", "%.")
+    local splitVal = string.split(valToString, "%.")
+
+    -- no decimal ?
+    if (splitVal == nil) then
+        return valToString
+    end
+
+    -- now create the new amount string including the correct decimal value
+    local retValString = ""
+    local beforeValue = splitVal[1]
+    local afterValue = splitVal[2]
+
+    if (string.len(afterValue) == 1) then
+        afterValue = afterValue .. "0"
+    end
+
+    retValString = beforeValue .. afterValue
+
+    return retValString
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: AddLeadingZerosToBarcodeString (string, integer)
+-- The function adds zero chars '0' to the given valString until count maxLenghtOfString is reached
+function AddLeadingZerosToBarcodeString(valString, maxLenghtOfString)
+    local application = "AddLeadingZerosToBarcodeString"
+    logToService(application, "Information", "Entry point", 3)
+
+    local newValString = valString
+    local zeroString = ""
+
+    if (string.len(valString) < maxLenghtOfString) then
+        -- fill up
+        local diffOfChars = maxLenghtOfString - string.len(valString)
+        for i = 1, diffOfChars do
+            zeroString = zeroString .. "0"
+        end
+        newValString = zeroString .. valString
+    end
+
+    return newValString
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: Search for items in table t
+function table.find(t, value)
+    if t and type(t) == "table" and value then
+        for _, v in ipairs(t) do
+            if v == value then
+                return true
+            end
+        end
+        return false
+    end
+    return false
+end
+
+--------------------------------------------------------------------------------------------------------
+-- <F>   ShowInfoDialog (string, integer, integer)
+-- This function shows an info message and close the dialog automatically if autoclose was set > 0
+-- messagetype can be 1 for info, 2 for warning, 3 for error
+function ShowInfoDialog(message, messagetype, autoclose)
+    local application = "ShowInfoDialog"
+    logToService(application, "Information", "Entry point", 3)
+
+    local messageTypeText = ""
+    if (messagetype <= 0 or messagetype > 3) then
+        logToService(application, "Error", "No guilty messagetype", 1)
+        return
+    end
+
+    if (tonumber(messagetype) == 1) then
+        messageTypeText = getText(txtInfo)
+    elseif (tonumber(messagetype) == 2) then
+        messageTypeText = getText(txtWarning)
+    elseif (tonumber(messagetype) == 3) then
+        messageTypeText = getText(txtError)
+    end
+
+    local isAutoclose = false
+    if (autoclose == nil) then
+        autoclose = 0
+    end
+
+    if (autoclose > 0) then
+        isAutoclose = true
+    end
+
+    local infoWindow = vpos.view.InfoWindow(message, messageTypeText, isAutoclose, autoclose)
+    infoWindow:show()
+end
+
+--------------------------------------------------------------------------------------------------------
+
+--=======================================================================================================================
+
+-- ***************************
+-- *** EVENTS
+-- ***************************
+function OnMediaBeforePayment(event)
+    local application = "OnMediaBeforePayment"
+    logToService(application, "Information", "Entry point", 2)
+
+    -- which payment type was selected?
+    -- check with configuration
+    local media = event:getMedia()
+    local mediaNo = media:getNo()
+
+    if (ActivateBarcodePrinting ~= nil and ActivateBarcodePrinting == true) then
+        if (table.find(AllowedMediaForBarcode, mediaNo)) then
+            local itemsTable = CreateItemsTableFromCurrentReceipt()
+            -- now get the items sum sorted by department group
+            if (itemsTable ~= nil and #itemsTable > 0) then
+                local sumTableDepartment = GetSumTableOfItemsPerTax(itemsTable)
+                if (sumTableDepartment ~= nil and #sumTableDepartment > 0) then
+                    if (CountOfEmptyLinesTop == nil) then
+                        CountOfEmptyLinesTop = 0
+                    end
+
+                    if (CountOfEmptyLinesBetweenBarcodes == nil) then
+                        CountOfEmptyLinesBetweenBarcodes = 0
+                    end
+
+                    if (tonumber(CountOfEmptyLinesTop) > 0) then
+                        AddEmptyLinesToFooter(tonumber(CountOfEmptyLinesTop))
+                    end
+
+                    if (PrintInfoText == true) then
+                        if (PrintInfoTextPosition == "top") then
+                            AddInfotextToFooter()
+                        end
+                    end
+
+                    for i, v in pairs(sumTableDepartment) do
+                        AddBarcodeToReceipt(v)
+                        if
+                            (#sumTableDepartment > 1 and i ~= #sumTableDepartment and
+                                tonumber(CountOfEmptyLinesBetweenBarcodes) > 0)
+                         then
+                            AddEmptyLinesToFooter(tonumber(CountOfEmptyLinesBetweenBarcodes))
+                        end
+                    end
+
+                    if (PrintInfoText == true) then
+                        if (PrintInfoTextPosition == "bottom") then
+                            AddInfotextToFooter()
+                        end
+                    end
+                else
+                    logToService(application, "Error", "No summed items found for barcode creation", 1)
+                    ShowInfoDialog(getText(txtNoSummedItemsFound), error, 5)
+                    event:setCancel(2)
+                end
+            else
+                logToService(application, "Error", "No items found in receipt for creating barcode", 1)
+                ShowInfoDialog(getText(txtNoItemsFoundInReceipt), error, 5)
+                event:setCancel(2)
+            end
+        end
+    else
+        logToService(application, "Warning", "Barcode printing is disabled in configuration", 1)
+    end
+end
+
+--=======================================================================================================================
+
+-- ***************************
+-- *** FUNCTIONS
+-- ***************************
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: CreateItemsTableFromCurrentReceipt ()
+-- returns a table fullfilled with all items
+--
+function CreateItemsTableFromCurrentReceipt()
+    local application = "CreateItemsTableFromCurrentReceipt"
+    logToService(application, "Information", "Entry point", 2)
+
+    local tmpItemsTable = {}
+
+    --  what do wee need for the items table?
+    --  a. article_id (plu no) = number
+    --  b. quantity = number
+    --  c. amount item summed
+
+    local receipt = vpos.receipt.Receipt()
+
+    if (receipt ~= nil) then
+        local operatorNo = receipt:getOperatorNo()
+        for rrplu in receipt:getPLUs() do
+            local tmpItem = {}
+            tmpItem.article_id = tonumber(rrplu:getPLUNo())
+            tmpItem.quantity = tonumber(rrplu:getQuantity())
+            tmpItem.amount = rrplu:getPrice()
+            tmpItem.tax = rrplu:getTaxNos()
+
+            if (rrplu:isVoidPLU() == true) then
+                tmpItem.quantity = tmpItem.quantity * -1
+            end
+            table.insert(tmpItemsTable, tmpItem)
+        end
+    end
+
+    return tmpItemsTable
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: AddBarcodeToReceipt (table)
+-- Add a barcode to the footer of the receipt
+--
+function AddBarcodeToReceipt(tblItemValues)
+    local application = "AddBarcodeToReceipt"
+    logToService(application, "Information", "Entry point", 2)
+
+    if (tblItemValues == nil) then
+        logToService(application, "Error", "Missing table values for barcode creation", 1)
+        return
+    end
+
+    receipt = vpos.accounting.Receipt()
+    if (receipt ~= nil) then
+        pt = receipt:getFooterPrintText()
+
+        if (tonumber(Barcodetype) == nil or tonumber(Barcodetype <= 0)) then
+            Barcodetype = 1
+        end
+
+        --BarcodePraefix
+        local praefix = ""
+        for l, m in pairs(BarcodePraefix) do
+            if (l == tblItemValues.tax) then
+                praefix = tostring(BarcodePraefix[tblItemValues.tax])
+                break
+            end
+        end
+
+        local barcodeStringWithoutLeadingZeros = GetStringAmountWithoutDecimalSign(tblItemValues.amount)
+        local barcodeValue = AddLeadingZerosToBarcodeString(barcodeStringWithoutLeadingZeros, 6)
+
+        pt:addBarcode(Barcodetype, praefix .. barcodeValue)
+    end
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: AddEmptyLinesToFooter (integer)
+-- Add [countOfLines] empty line(s) to the receipt
+--
+function AddEmptyLinesToFooter(countOfLines)
+    local application = "AddEmptyLinesToFooter"
+    logToService(application, "Information", "Entry point", 2)
+
+    local receipt = vpos.accounting.Receipt()
+    if (receipt ~= nil) then
+        pt = receipt:getFooterPrintText()
+        for i = 1, countOfLines do
+            pt:addText("\n")
+        end
+    end
+end
+
+--------------------------------------------------------------------------------------------------------
+--
+-- Function: AddInfotextToFooter ()
+-- Add the text from lang file 800 - 802 to the receipt footer
+--
+function AddInfotextToFooter()
+    local application = "AddInfotextToFooter"
+    logToService(application, "Information", "Entry point", 2)
+
+    local receipt = vpos.accounting.Receipt()
+    if (receipt ~= nil) then
+        pt = receipt:getFooterPrintText()
+        pt:addText(getText(txtInfotextLine1) .. "\n")
+        pt:addText(getText(txtInfotextLine2) .. "\n")
+        pt:addText(getText(txtInfotextLine3) .. "\n")
+    end
+end
+
+--------------------------------------------------------------------------------------------------------
+-- <F>   GetSumTableOfItemsPerTax (table)
+-- IN / OUT:  table, table
+-- This function returns a table with cumulated sum of items per tax
+function GetSumTableOfItemsPerTax(tblItems)
+    local application = "GetSumTableOfItemsPerTax"
+    logToService(application, "Information", "Entry point", 2)
+
+    local tblReturn = {}
+
+    if (tblItems == nil or #tblItems == 0) then
+        return nil
+    end
+
+    for i, v in pairs(tblItems) do
+        -- get the tax number of the given item. The tx info is set within the tblItem
+        local taxNumber = v.tax
+        if (taxNumber == nil or tonumber(taxNumber) == 0) then
+            logToService(application, "Error", "Tax is missing for item!", 1)
+            ShowInfoDialog(getText(txtTaxMissingOnItem), error, 5)
+            return nil
+        end
+
+        if (#tblReturn == 0) then
+            -- no items in table before - save directly without check
+            local tblItem = {}
+            tblItem.tax = taxNumber
+            tblItem.amount = v.amount
+            table.insert(tblReturn, tblItem)
+        else
+            -- items found - check the tax
+            local itemWasFound = false
+            for j, k in pairs(tblReturn) do
+                if (k.tax == taxNumber) then
+                    itemWasFound = true
+
+                    local tblItem = {}
+                    tblItem.tax = taxNumber
+                    tblItem.amount = k.amount + v.amount
+
+                    table.remove(tblReturn, j)
+                    table.insert(tblReturn, tblItem)
+                    break
+                end
+            end
+
+            if (itemWasFound == false) then
+                local tblItem = {}
+                tblItem.tax = taxNumber
+                tblItem.amount = v.amount
+                table.insert(tblReturn, tblItem)
+            end
+        end
+    end
+
+    return tblReturn
+end
+
+--------------------------------------------------------------------------------------------------------
+
+--=======================================================================================================================
+
+-- ***************************
+-- *** MAIN
+-- ***************************
+
+local applicationName = "MAIN"
+
+-- read ini file
+ini = vpos.script.Script(sIniFile)
+if (ini == nil) then
+    ini = vpos.script.newScript(sIniFile)
+end
+if (ini ~= nil) then
+    txt = ini:getData()
+    loadstring(txt)()
+end
+
+-- read language file
+langTab = vpos.utils.readIniFromFile(sLangFile)
+if (lang == nil) then
+    lang = vpos.getSystemInfo(vpos.SystemInfo.FlashLanguage) -- Ger
+end
+
+-- check decimal sign
+decimalTable = vpos.tables.Table(decimalTableValue)
+decimalTableData = decimalTable:getData(1, 5) -- (Nummer des Records, wo die dezimalstellen gesetzt werden, Feldnummer der dezimalstellen)
+
+-- check currency
+currencyTable = vpos.tables.Table(currencyTableValue)
+currencyTableData = currencyTable:getData(1, 1) -- (Nummer des Records, wo das Trennzeichen gesetzt werden, Feldnummer des Trennzeichen)
+
+-- get system informations
+posNo = vpos.getSystemInfo(vpos.SystemInfo.ECRNo)
+
+-- write log header for application
+logToService(applicationName, "Information", "====================================================================", 1)
+logToService(applicationName, "Information", appName, 1)
+logToService(applicationName, "Information", "Script-Version: " .. ScriptV, 1)
+logToService(applicationName, "Information", "Language: " .. lang, 1)
+logToService(applicationName, "Information", "====================================================================", 1)
+
+-- activate the listeners
+vpos.events.registerEventFunction(vpos.events.OnMediaBeforePayment, "OnMediaBeforePayment")
